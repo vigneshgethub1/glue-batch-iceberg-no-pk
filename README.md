@@ -1,0 +1,10 @@
+arguments
+--iceberg_table_name
+--timestamp_col
+--dynamodb_table
+--warehouse_name
+--s3_input_path
+--database_name
+--partition_column
+--JOB_NAME
+--load_type
