@@ -1,0 +1,322 @@
+import sys
+import logging
+import time
+import pytz
+from datetime import datetime, timedelta
+from pyspark.sql.functions import date_sub, to_date, col, lit, concat_ws, md5, max as spark_max, row_number
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+import boto3
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+class IcebergJob:
+    def __init__(self, spark, glue_context, args):
+        self.spark = spark
+        self.glue_context = glue_context
+        self.args = args
+
+        self.database_name = args["database_name"].strip()
+        self.table_names = [t.strip() for t in args["iceberg_table_name"].split(",")]
+        self.s3_paths = [p.strip() for p in args["s3_input_path"].split(",")]
+        self.warehouse_path = args["warehouse_name"].strip()
+
+        self.partition_column = (
+            [t.strip() for t in args["partition_column"].split(",")]
+            if "partition_column" in args and args["partition_column"].strip()
+            else None
+        )
+        self.timestamp_col = args.get("timestamp_col", "").strip()
+        self.dynamo_table = args["dynamodb_table"].strip()
+        self.load_type = args.get("load_type").strip().lower()
+
+        if not self.timestamp_col:
+            raise ValueError("timestamp_col is required for incremental processing.")
+
+    def run(self):
+        job_start = time.time()
+
+        logger.info(
+            f"Starting ETL job for database '{self.database_name}' with warehouse '{self.warehouse_path}'"
+        )
+        logger.info(f"Processing tables: {self.table_names}")
+        logger.info(f"Corresponding S3 input paths: {self.s3_paths}")
+
+        self._create_database_if_not_exists(self.database_name)
+
+        success_count, failure_count = 0, 0
+
+        for table_name, s3_path in zip(self.table_names, self.s3_paths):
+            try:
+                logger.info(f"Processing table '{table_name}' with data from '{s3_path}'")
+                df_full = self._read_data(s3_path,self.load_type)
+                source_latest_ts = self._get_latest_timestamp(df_full, self.timestamp_col)
+                logger.info(f"Source latest timestamp for {table_name}: {source_latest_ts}")
+
+                # Process with incremental + dedup logic
+                self.process_incremental_with_dedup(table_name, df_full)
+
+                # Optional Iceberg maintenance
+                self._run_optimizations(table_name)
+
+                # Update Dynamo with source_latest_ts (not filtered max) and job duration
+                self._post_success_update_dynamo(table_name, source_latest_ts, job_start)
+
+                success_count += 1
+                logger.info(f"Completed processing for table '{table_name}'")
+
+            except Exception as ex:
+                logger.error(f"Error processing table '{table_name}': {ex}", exc_info=True)
+                failure_count += 1
+
+        logger.info(f"Job finished: {success_count} succeeded, {failure_count} failed")
+
+
+# incremental processing with deduplication
+    def process_incremental_with_dedup(self, table_name: str, df_full):
+        full_table_name = f"glue_catalog.{self.database_name}.{table_name}"
+        self._validate_partition_column(df_full)
+        if not self._check_table_exists(self.database_name, table_name):
+            logger.info(f"Table {full_table_name} does not exist. Creating and loading full data.")
+            df_full = self._add_surrogate_key(df_full)
+            self._create_table(df_full, table_name, self.warehouse_path)
+            latest_ts = self._get_latest_timestamp(df_full, self.timestamp_col)
+            self._post_success_update_dynamo(table_name, latest_ts, time.time())
+            logger.info(f"Table {table_name} created and full data loaded successfully.")
+            return
+        last_ts_str = self.get_last_processed_timestamp(self.dynamo_table, table_name)
+        logger.info(f"")
+        if last_ts_str:
+            last_ts_col = lit(last_ts_str).cast("timestamp")
+            df_filtered = df_full.filter(
+                to_date(col(self.timestamp_col)) >= date_sub(to_date(last_ts_col), 1)
+            )
+        else:
+            df_filtered = df_full
+
+        if df_filtered.rdd.isEmpty():
+            logger.info(f"No new rows for {table_name} after incremental filter.")
+            latest_ts = self._get_latest_timestamp(df_full, self.timestamp_col)
+            self._post_success_update_dynamo(table_name, latest_ts, time.time())
+            return
+
+        df_filtered = self._add_surrogate_key(df_filtered)
+        window_spec = Window.partitionBy("surrogate_key").orderBy(col(self.timestamp_col).desc())
+        df_dedup = df_filtered.withColumn("row_num", row_number().over(window_spec))
+        df_dedup = df_dedup.filter(col("row_num") == 1).drop("row_num")
+        logger.info(f"After deduplication, {df_dedup.count()} rows to process for {table_name}")
+
+        temp_view = "temp_dedup_keys"
+        df_dedup.createOrReplaceTempView(temp_view)
+        merge_columns = ", ".join([f"{col}=s.{col}" for col in df_dedup.columns if col != "surrogate_key"])
+        update_set = ", ".join([f"t.{col} = s.{col}" for col in df_dedup.columns if col != "surrogate_key"])
+        insert_cols = ", ".join(df_dedup.columns)
+        insert_vals = ", ".join([f"s.{col}" for col in df_dedup.columns])
+        merge_sql = f"""
+            MERGE INTO {full_table_name} t
+            USING {temp_view} s
+            ON t.surrogate_key = s.surrogate_key
+            WHEN MATCHED THEN UPDATE SET {update_set}
+            WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+        """
+        self.spark.sql(merge_sql)
+        logger.info(f"Merged deduplicated rows into {full_table_name} using surrogate_keys.")
+        
+        if "Op" in df_dedup.columns:
+            df_dedup = df_dedup.drop("Op")
+
+        latest_ts = df_dedup.agg({self.timestamp_col: "max"}).collect()[0][0]
+        self.update_dynamodb(self.dynamo_table, table_name, str(latest_ts), datetime.utcnow().isoformat())
+        logger.info(f"DynamoDB updated for table {table_name} with latest timestamp {latest_ts}")
+
+# creating database if not exists
+    def _create_database_if_not_exists(self, database_name: str):
+        self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {database_name}")
+        logger.info(f"Ensured database exists: {database_name}")
+
+# reading data from s3 path
+    def _read_data(self, s3_path, load_type):
+        logger.info(f"load type = {load_type}")
+        if load_type == "full":
+            s3_path = s3_path
+            logger.info(f"Full load selected. Using S3 path: {s3_path}")
+        else :
+            ist = pytz.timezone('Asia/Kolkata')
+            today = datetime.now(ist)
+            prev_day = today-timedelta(days=1)
+            date_path = prev_day.strftime("%Y/%m/%d")
+            path_without_scheme = s3_path.replace("s3://", "")
+            parts = path_without_scheme.split("/")
+            bucket = parts[0]
+            dn_name = parts[1]
+            db_name = parts[2]
+            schema_name = parts[3]
+            table_name = parts[4]
+
+
+            s3_path = f"s3://{bucket}/{dn_name}/{db_name}/{schema_name}/{table_name}/{date_path}/"
+            logger.info(f"Constructed S3 path for incremental load: {s3_path}")
+
+        try:
+            df = self.spark.read.format("parquet").load(s3_path)
+            row_count = df.count()
+            logger.info(f"Read {row_count} rows from {s3_path}")
+            df.printSchema()
+            if row_count == 0:
+                raise ValueError(f"No data found at path: {s3_path}")
+            return df
+        except Exception as e:
+            logger.info(f"Failed to read data from {s3_path} : {e}")
+
+# getting latest timestamp from dataframe
+    def _get_latest_timestamp(self, df, timestamp_col: str) -> str:
+        logger.info(f"Getting latest timestamp from dataframe")
+        latest_ts = df.select(spark_max(col(timestamp_col)).alias("max_ts")).collect()[0]["max_ts"]
+        logger.info(f"latest timestamp from dataframe {latest_ts}")
+        return str(latest_ts) if latest_ts is not None else None
+
+# validating partition column
+    def _validate_partition_column(self, df):
+        if not self.partition_column:
+            return
+        cols = self.partition_column if isinstance(self.partition_column, list) else [self.partition_column]
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Partition columns {missing} not found in input data")
+        logger.info(f"Partition columns {cols} validated")
+
+# checking table existence and is there corruption
+
+    def _check_table_exists(self, database_name: str, table_name: str) -> bool:
+        full_table_name = f"glue_catalog.{database_name}.{table_name}"
+        try:
+            tables_df = self.spark.sql(f"SHOW TABLES IN glue_catalog.{database_name}")
+            existing_tables = [row["tableName"] for row in tables_df.collect()]
+            if table_name not in existing_tables:
+                logger.info(f"Table {table_name} not present in catalog.")
+                return False
+            self.spark.sql(f"DESCRIBE TABLE {full_table_name}").collect()
+            logger.info(f"Table {table_name} exists and is accessible.")
+            return True
+        except Exception as access_error:
+            error_msg = str(access_error).lower()
+            corruption_indicators = ["inputformat cannot be null", "storagedescriptor", "hiveexception", "unable to fetch table"]
+            if any(ind in error_msg for ind in corruption_indicators):
+                logger.warning(f"Table {table_name} appears corrupted: {access_error}. Dropping it.")
+                self.spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+                logger.info(f"Dropped corrupted table {table_name}.")
+                return False
+            raise
+
+# creating table
+    def _create_table(self, df, table_name: str, warehouse_path: str):
+        writer = (
+            df.writeTo(f"glue_catalog.{self.database_name}.{table_name}")
+            .using("iceberg")
+            .tableProperty("location", f"{warehouse_path}/{table_name}")
+            .tableProperty("format-version", "2")
+        )
+        if self.partition_column:
+            writer = writer.partitionedBy(*self.partition_column) if isinstance(self.partition_column, list) else writer.partitionedBy(self.partition_column)
+        writer.create()
+        logger.info(f"Iceberg table {self.database_name}.{table_name} created successfully.")
+
+    def _append_data(self, df, table_name: str):
+        df.writeTo(f"glue_catalog.{self.database_name}.{table_name}").append()
+        logger.info(f"Data appended to Iceberg table {self.database_name}.{table_name}")
+
+    def _add_surrogate_key(self, df):
+        return df.withColumn("surrogate_key", md5(concat_ws("||", *df.columns)))
+
+    def update_dynamodb(self, dynamo_table_name: str, dataset_name: str, s3_last_timestamp: str, job_running_time: str):
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(dynamo_table_name)
+        table.put_item(
+            Item={
+                "Table_name": dataset_name,
+                "s3_last_timestamp": s3_last_timestamp,
+                "job_running_time": job_running_time,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        )
+        logger.info(f"Updating DynamoDbb for {dataset_name} with timestamp {s3_last_timestamp} and job time {job_running_time}")
+
+    def get_last_processed_timestamp(self, dynamo_table_name: str, dataset_name: str):
+        logger.info(f"Getting last processed from dynamodb")
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(dynamo_table_name)
+        try:
+            response = table.get_item(Key={"Table_name": dataset_name})
+            logger.info(f"{response}")
+            return response.get("Item", {}).get("s3_last_timestamp")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch last processed timestamp from DynamoDB: {e}")
+            return None
+
+    def _post_success_update_dynamo(self, table_name: str, s3_last_timestamp: str, job_start: float):
+        duration = f"{round(time.time() - job_start, 2)}s"
+        self.update_dynamodb(self.dynamo_table, table_name, s3_last_timestamp, duration)
+
+    def _run_optimizations(self, table_name: str):
+        full_table = f"glue_catalog.{self.database_name}.{table_name}"
+        try:
+            logger.info(f"Running data file compaction for {full_table}")
+            self.spark.sql(f"CALL system.rewrite_data_files(table => '{full_table}')")
+            logger.info(f"Running snapshot expiration for {full_table}")
+            self.spark.sql(f"CALL system.expire_snapshots(table => '{full_table}')")
+        except Exception as ex:
+            logger.warning(f"Iceberg optimization failed for {full_table}: {ex}")
+
+def main():
+    args = getResolvedOptions(
+        sys.argv,
+        ["JOB_NAME",
+         "database_name",
+         "iceberg_table_name",
+         "s3_input_path",
+         "warehouse_name",
+         "partition_column",
+         "timestamp_col",
+         "dynamodb_table",
+         "load_type"]
+    )
+
+    spark = (
+        SparkSession.builder.appName("Glue-Iceberg-Incremental-ETL")
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+        .config("spark.sql.catalog.glue_catalog.warehouse", args["warehouse_name"])
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+        .config("spark.hadoop.fs.s3a.connection.maximum", "200")
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "5000")
+        .config("spark.sql.defaultCatalog", "glue_catalog")
+        .config("spark.sql.warehouse.dir", args["warehouse_name"])
+        .getOrCreate()
+    )
+
+    glue_context = GlueContext(spark.sparkContext)
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+
+    etl_job = IcebergJob(spark, glue_context, args)
+    etl_job.run()
+
+    job.commit()
+    logger.info(f"Glue job {args['JOB_NAME']} completed successfully")
+
+if __name__ == "__main__":
+    main()
+
+
+
